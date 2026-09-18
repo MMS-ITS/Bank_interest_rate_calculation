@@ -26,15 +26,17 @@ Usage:
 from __future__ import annotations
 
 import datetime as dt
+import re
 import sys
 
 from openpyxl import Workbook
 from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
 from openpyxl.utils import get_column_letter
-from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.workbook.protection import WorkbookProtection
 from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.worksheet.pagebreak import Break
+from openpyxl.worksheet.properties import PageSetupProperties
 
 # --------------------------------------------------------------------------------------
 # Configuration
@@ -125,6 +127,41 @@ CELL_R3_DATE, CELL_R3_PCT = "K9", "L9"
 QMODE_CAL = "Calendar quarter-ends"
 QMODE_ANN = "3 months from B/F date"
 
+# --------------------------------------------------------------------------------------
+# Reference resolution
+# --------------------------------------------------------------------------------------
+# Formulas below are written with readable symbolic names, but the workbook deliberately
+# contains NO defined names: every name is expanded into a direct cell reference when the
+# cell is written. Excel 365 rejected the workbook-level defined names this file used to
+# carry ("Removed Records: Named range from /xl/workbook.xml"), which in turn invalidated
+# every formula that referenced them. Direct references have no such failure mode.
+NAME_REFS: dict[str, tuple[str, str]] = {
+    "BF_Date": (SHEET_MAIN, f"${CELL_BF_DATE[0]}${CELL_BF_DATE[1:]}"),
+    "BF_Amount": (SHEET_MAIN, f"${CELL_BF_AMT[0]}${CELL_BF_AMT[1:]}"),
+    "Day_Basis": (SHEET_MAIN, f"${CELL_BASIS[0]}${CELL_BASIS[1:]}"),
+    "Qtr_Mode": (SHEET_MAIN, f"${CELL_QMODE[0]}${CELL_QMODE[1:]}"),
+    "Locked_To": (SHEET_MAIN, f"${CELL_LOCKED[0]}${CELL_LOCKED[1:]}"),
+    "Eff_Dates": (SHEET_MAIN, f"$O${ROW_LEDGER}:$O${LAST_ROW}"),
+    "Bal_Col": (SHEET_MAIN, f"$S${ROW_LEDGER}:$S${LAST_ROW}"),
+    "Accr_Col": (SHEET_MAIN, f"$T${ROW_LEDGER}:$T${LAST_ROW}"),
+    "Big_Date": (SHEET_ENG, "$B$1"),
+    "R1_From": (SHEET_ENG, "$B$2"), "R1_To": (SHEET_ENG, "$B$3"),
+    "R2_From": (SHEET_ENG, "$B$4"), "R2_To": (SHEET_ENG, "$B$5"),
+    "R3_From": (SHEET_ENG, "$B$6"), "R3_To": (SHEET_ENG, "$B$7"),
+    "Rate_1": (SHEET_ENG, "$B$8"), "Rate_2": (SHEET_ENG, "$B$9"),
+    "Rate_3": (SHEET_ENG, "$B$10"),
+}
+NAME_RE = re.compile(r"\b(" + "|".join(sorted(NAME_REFS, key=len, reverse=True)) + r")\b")
+
+
+def resolve(formula: str, sheet: str) -> str:
+    """Expand the symbolic names in a formula into direct references, qualified with the
+    sheet name when they point at a different sheet."""
+    def repl(m):
+        target, ref = NAME_REFS[m.group(0)]
+        return ref if target == sheet else f"'{target}'!{ref}"
+    return NAME_RE.sub(repl, formula)
+
 
 # --------------------------------------------------------------------------------------
 # Helpers
@@ -140,6 +177,33 @@ def rate_factor(d1: str, d2: str) -> str:
     return "(" + "+".join(parts) + ")/100/Day_Basis"
 
 
+def setup_print(ws, *, landscape: bool, title_rows: str | None = None,
+                header: str = "", footer_left: str = ""):
+    """A4 page setup: one page wide, as many pages tall as needed."""
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4          # 9
+    ws.page_setup.orientation = "landscape" if landscape else "portrait"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0                      # 0 = unlimited pages downwards
+    ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+    ws.page_margins.left = ws.page_margins.right = 0.3
+    ws.page_margins.top = 0.55
+    ws.page_margins.bottom = 0.5
+    ws.page_margins.header = ws.page_margins.footer = 0.2
+    ws.print_options.horizontalCentered = True
+    ws.print_options.gridLines = False
+    if title_rows:
+        ws.print_title_rows = title_rows
+    if header:
+        ws.oddHeader.left.text = header
+        ws.oddHeader.left.size = 8
+        ws.oddHeader.right.text = "Printed &D"
+        ws.oddHeader.right.size = 8
+    ws.oddFooter.left.text = footer_left or "&F"
+    ws.oddFooter.left.size = 8
+    ws.oddFooter.center.text = "Page &P of &N"
+    ws.oddFooter.center.size = 8
+
+
 def qtr_rows(q: int) -> tuple[int, int, int, int, int]:
     """(header row, B/F row, first entry row, last entry row, quarter-end row)"""
     start = ROW_LEDGER + (q - 1) * BLOCK
@@ -150,6 +214,8 @@ def put(ws, row, col, value=None, *, fmt=None, font=None, fill=None, align=None,
         border=BOX, unlocked=False):
     c = ws.cell(row=row, column=col)
     if value is not None:
+        if isinstance(value, str) and value.startswith("="):
+            value = resolve(value, ws.title)
         c.value = value
     if fmt:
         c.number_format = fmt
@@ -197,7 +263,7 @@ def build_engine(wb):
     ]
     for i, (name, formula) in enumerate(rows, start=1):
         ws.cell(row=i, column=1, value=name).font = F_BODY
-        ws.cell(row=i, column=2, value=formula)
+        ws.cell(row=i, column=2, value=resolve(formula, ws.title))
 
     # live figures (display only - the ledger never depends on TODAY())
     live = [
@@ -215,7 +281,7 @@ def build_engine(wb):
     ]
     for r, name, formula in live:
         ws.cell(row=r, column=1, value=name).font = F_BODY
-        ws.cell(row=r, column=2, value=formula)
+        ws.cell(row=r, column=2, value=resolve(formula, ws.title))
 
     # quarter calendar: D=q, E=start, F=end, G=rate text
     for h, col in (("Q#", 4), ("Start", 5), ("End", 6), ("Rates in quarter", 7)):
@@ -234,13 +300,13 @@ def build_engine(wb):
         r = q + 1
         ws.cell(row=r, column=4, value=q)
         if q == 1:
-            ws.cell(row=r, column=5, value='=IF(BF_Date="",0,BF_Date)')
-            ws.cell(row=r, column=6, value=first_qe)
+            ws.cell(row=r, column=5, value=resolve('=IF(BF_Date="",0,BF_Date)', ws.title))
+            ws.cell(row=r, column=6, value=resolve(first_qe, ws.title))
         else:
             ws.cell(row=r, column=5, value=f"=$F${r - 1}")
             ws.cell(row=r, column=6,
-                    value=f'=IF($F${r - 1}=0,0,IF(Qtr_Mode="{QMODE_CAL}",'
-                          f"EOMONTH($F${r - 1},3),EDATE($F${r - 1},3)))")
+                    value=resolve(f'=IF($F${r - 1}=0,0,IF(Qtr_Mode="{QMODE_CAL}",'
+                                  f"EOMONTH($F${r - 1},3),EDATE($F${r - 1},3)))", ws.title))
         ws.cell(row=r, column=5).number_format = DATE_FMT
         ws.cell(row=r, column=6).number_format = DATE_FMT
 
@@ -249,7 +315,7 @@ def build_engine(wb):
             ov = f"MAX(0,MIN($F${r},R{n}_To)-MAX($E${r},R{n}_From))"
             seg.append(f'IF({ov}>0,TEXT(Rate_{n},"0.00")&"% for "&{ov}&'
                        f'IF({ov}=1," day   "," days   "),"")')
-        ws.cell(row=r, column=7, value="=TRIM(" + "&".join(seg) + ")")
+        ws.cell(row=r, column=7, value=resolve("=TRIM(" + "&".join(seg) + ")", ws.title))
 
     ws.sheet_state = "veryHidden"
     ws.protection.password = PASSWORD
@@ -266,8 +332,10 @@ def build_main(wb):
     ws.title = SHEET_MAIN
     E = f"'{SHEET_ENG}'!"
 
-    widths = {1: 6, 2: 12.5, 3: 15, 4: 44, 5: 14, 6: 14, 7: 16, 8: 10.5,
-              9: 7.5, 10: 14, 11: 15, 12: 15, 13: 12, 14: 12.5}
+    # Widths are tuned so the 14 printed columns fit one A4 page across in landscape
+    # (total ~159 units ~ 13.4 in, scaled to the 11.1 in printable width).
+    widths = {1: 4.5, 2: 10.5, 3: 11, 4: 27, 5: 12, 6: 12, 7: 13.5, 8: 7.5,
+              9: 5.5, 10: 12, 11: 12, 12: 12.5, 13: 10.5, 14: 8.5}
     for col, w in widths.items():
         ws.column_dimensions[L[col]].width = w
     for col in (C_EFF, C_QS, C_QE, C_RTXT, C_BALH, C_ACCRH):
@@ -382,7 +450,7 @@ def build_main(wb):
             calc(ws, r, 13, f'=IF(${pcell[0]}${pcell[1:]}="","\u2013","till date")', align=CENTER)
         calc(ws, r, 14,
              f'=IF(${pcell[0]}${pcell[1:]}="","(slot free)",'
-             f'IF(AND(Locked_To<>"",${dcell[0]}${dcell[1:]}<=Locked_To),"\U0001f512 LOCKED","EDITABLE"))',
+             f'IF(AND(Locked_To<>"",${dcell[0]}${dcell[1:]}<=Locked_To),"\u25a0 LOCKED","EDITABLE"))',
              align=CENTER, font=Font(bold=True, size=9))
 
     for i, note in enumerate((
@@ -432,7 +500,7 @@ def build_main(wb):
             f'"QUARTER {q}          "&TEXT($P${hdr},"DD-MM-YYYY")&"   to   "'
             f'&TEXT($Q${hdr},"DD-MM-YYYY")&"          "'
             f'&IF(AND(Locked_To<>"",$Q${hdr}<=Locked_To),'
-            f'"\U0001f512 LOCKED \u2013 reconciled, no entry allowed","\u25b6 OPEN for entry")'
+            f'"\u25a0 LOCKED \u2013 reconciled, no entry allowed","\u25b7 OPEN for entry")'
             f'&"          RATE(S) APPLIED :  "&$R${hdr})',
             font=F_WHITE_B, fill=CLR_QBAR, align=LEFT)
         ws.row_dimensions[hdr].height = 18
@@ -525,10 +593,15 @@ def build_main(wb):
     add_validations(ws)
     add_conditional_formats(ws)
 
-    ws.print_title_rows = f"{ROW_TBL_HDR}:{ROW_TBL_HDR}"
-    ws.page_setup.orientation = "landscape"
-    ws.page_setup.fitToWidth = 1
-    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    # A4 landscape, ledger header repeated on every page, and a page break placed so a
+    # quarter block is never split across two pages (2 blocks on page 1 under the setup
+    # panel, 3 blocks per page after that).
+    setup_print(ws, landscape=True, title_rows=f"{ROW_TBL_HDR}:{ROW_TBL_HDR}",
+                header="Bank loan account \u2013 quarterly compound interest statement")
+    for q in range(1, QUARTERS):
+        if q == 2 or (q > 2 and (q - 2) % 3 == 0):
+            ws.row_breaks.append(Break(id=qtr_rows(q)[4]))
+
     ws.protection.password = PASSWORD
     ws.protection.sheet = True
     ws.protection.enable()
@@ -554,6 +627,10 @@ def dv(ws, kind, sqref, *, formula1=None, formula2=None, operator=None,
         formula1 = formula1[1:]
     if isinstance(formula2, str) and formula2.startswith("="):
         formula2 = formula2[1:]
+    if isinstance(formula1, str) and not formula1.startswith('"'):
+        formula1 = resolve(formula1, ws.title)
+    if isinstance(formula2, str) and not formula2.startswith('"'):
+        formula2 = resolve(formula2, ws.title)
     d = DataValidation(type=kind, operator=operator, formula1=formula1, formula2=formula2,
                        allow_blank=True, showErrorMessage=True, showInputMessage=bool(prompt),
                        errorStyle="stop")
@@ -664,7 +741,8 @@ def build_summary(wb):
     ws = wb.create_sheet(SHEET_SUM)
     M = f"'{SHEET_MAIN}'!"
     E = f"'{SHEET_ENG}'!"
-    widths = {1: 6, 2: 13, 3: 13, 4: 16, 5: 16, 6: 15, 7: 16, 8: 38, 9: 15, 10: 12, 11: 11, 12: 11}
+    widths = {1: 5, 2: 11, 3: 11, 4: 14.5, 5: 14.5, 6: 13.5, 7: 14.5, 8: 30,
+              9: 13.5, 10: 10.5, 11: 9, 12: 9}
     for c, w in widths.items():
         ws.column_dimensions[get_column_letter(c)].width = w
 
@@ -739,9 +817,8 @@ def build_summary(wb):
         f"A5:L{4 + QUARTERS}",
         FormulaRule(formula=['$K5="LOCKED"'], fill=PatternFill("solid", bgColor=CLR_LOCK)))
 
-    ws.page_setup.orientation = "landscape"
-    ws.page_setup.fitToWidth = 1
-    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    setup_print(ws, landscape=True, title_rows="4:4",
+                header="Bank loan account \u2013 quarter-by-quarter summary")
     ws.protection.password = PASSWORD
     ws.protection.sheet = True
     ws.protection.enable()
@@ -810,6 +887,10 @@ HELP = [
           "dates \u00f7 basis."),
     ("B", "Interest is rounded to 2 decimals only at the moment it is capitalised, exactly like a "
           "bank ledger."),
+    ("B", "Printing is set up for A4. The statement and the summary print landscape, scaled to "
+          "one page wide, with the column headings repeated on every page, each quarter kept "
+          "whole on a page, and \u2018Page n of m\u2019 in the footer. This guide prints A4 "
+          "portrait. Just press Ctrl+P \u2013 no page setup needed."),
     ("B", "Sheet/workbook password: " + PASSWORD + " \u2013 keep it with the file owner. You only "
           "need it to change the structure (for example to add more repayment rows or quarters)."),
     ("N", "Ask for a rebuilt file if you need more than 3 rate slots, more rows per quarter, a "
@@ -821,7 +902,7 @@ HELP = [
 def build_help(wb):
     ws = wb.create_sheet(SHEET_HELP)
     ws.column_dimensions["A"].width = 3
-    ws.column_dimensions["B"].width = 120
+    ws.column_dimensions["B"].width = 93
     ws.sheet_view.showGridLines = False
     ws.merge_cells("A1:B1")
     put(ws, 1, 1, "BANK LOAN \u2013 QUARTERLY COMPOUND INTEREST FILE  \u00b7  USER GUIDE",
@@ -837,7 +918,7 @@ def build_help(wb):
         elif kind == "B":
             put(ws, r, 1, "\u2022", font=F_BODY_B, align=CENTER, border=None)
             c = put(ws, r, 2, text, font=F_BODY, align=WRAP_L, border=None)
-            ws.row_dimensions[r].height = 15 * (1 + len(text) // 110)
+            ws.row_dimensions[r].height = 15 * (1 + len(text) // 88)
         elif kind == "N":
             ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=2)
             put(ws, r, 1, text, font=Font(size=10, italic=True, color="7F6000"),
@@ -846,39 +927,16 @@ def build_help(wb):
         else:
             ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=2)
             put(ws, r, 1, text, font=F_BODY, align=WRAP_L, border=None)
-            ws.row_dimensions[r].height = 15 * (1 + len(text) // 110)
+            ws.row_dimensions[r].height = 15 * (1 + len(text) // 88)
         r += 2 if kind == "H" else 1
 
+    setup_print(ws, landscape=False,
+                header="Bank loan \u2013 quarterly compound interest file \u00b7 user guide")
     ws.protection.password = PASSWORD
     ws.protection.sheet = True
     ws.protection.enable()
     ws.protection.selectLockedCells = False
     return ws
-
-
-# --------------------------------------------------------------------------------------
-# Named ranges
-# --------------------------------------------------------------------------------------
-def add_names(wb):
-    main = f"'{SHEET_MAIN}'!"
-    eng = f"'{SHEET_ENG}'!"
-    names = {
-        "BF_Date": f"{main}${CELL_BF_DATE[0]}${CELL_BF_DATE[1:]}",
-        "BF_Amount": f"{main}${CELL_BF_AMT[0]}${CELL_BF_AMT[1:]}",
-        "Day_Basis": f"{main}${CELL_BASIS[0]}${CELL_BASIS[1:]}",
-        "Qtr_Mode": f"{main}${CELL_QMODE[0]}${CELL_QMODE[1:]}",
-        "Locked_To": f"{main}${CELL_LOCKED[0]}${CELL_LOCKED[1:]}",
-        "Eff_Dates": f"{main}$O${ROW_LEDGER}:$O${LAST_ROW}",
-        "Bal_Col": f"{main}$S${ROW_LEDGER}:$S${LAST_ROW}",
-        "Accr_Col": f"{main}$T${ROW_LEDGER}:$T${LAST_ROW}",
-        "Big_Date": f"{eng}$B$1",
-        "R1_From": f"{eng}$B$2", "R1_To": f"{eng}$B$3",
-        "R2_From": f"{eng}$B$4", "R2_To": f"{eng}$B$5",
-        "R3_From": f"{eng}$B$6", "R3_To": f"{eng}$B$7",
-        "Rate_1": f"{eng}$B$8", "Rate_2": f"{eng}$B$9", "Rate_3": f"{eng}$B$10",
-    }
-    for name, ref in names.items():
-        wb.defined_names.add(DefinedName(name, attr_text=ref))
 
 
 # --------------------------------------------------------------------------------------
@@ -967,7 +1025,6 @@ def build(path: str, example: bool = False, freeze: bool = False):
     build_summary(wb)
     build_help(wb)
     build_engine(wb)
-    add_names(wb)
     if example:
         fill_example(main)
     if freeze:

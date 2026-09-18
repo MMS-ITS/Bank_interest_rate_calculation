@@ -88,6 +88,30 @@ immediately, and `--freeze-setup` produces a build where the opening position an
 original rate are written as **locked** cells, leaving only future repayments, revisions and
 the lock date editable.
 
+## Printing (A4)
+
+Both worksheets are set up for A4, so `Ctrl+P` is all that is needed:
+
+* **Loan Statement** – A4 landscape, scaled to exactly one page wide, column widths tuned so
+  the 14 columns fit at roughly 90% scale (still legible). The column-heading row repeats on
+  every page, manual page breaks keep each quarter block whole on a page (two blocks on
+  page 1 below the setup panel, three per page after that), and the footer carries
+  `Page n of m`.
+* **Quarter Summary** – A4 landscape, one page wide, heading row repeated.
+* **How to Use** – A4 portrait, one page wide.
+
+## No defined names, by design
+
+Excel 365 rejected the first build with *"Removed Records: Named range from
+/xl/workbook.xml"* followed by the loss of formulas on the two sheets that referenced those
+names. The workbook therefore carries **no workbook-level defined names at all**: the
+generator still writes formulas with readable symbolic names (`Rate_2`, `Locked_To`, …) but
+`resolve()` expands each one into a direct cell reference (`'Engine'!$B$9`, `$H$10`, …) as
+the cell is written, for worksheet formulas and data-validation rules alike. Emoji were also
+removed from formula strings, since non-BMP characters are a needless risk inside formulas.
+The only remaining entries are the two standard `_xlnm.Print_Titles` records that Excel
+itself writes for repeating print headings.
+
 ## Rebuilding and verifying
 
 ```bash
@@ -111,8 +135,12 @@ Verification status of the committed files:
   failures).
 * Raising the second rate from 10.50% to 25.00%, and moving its effective date, leaves every
   quarter that closed earlier bit-identical while later quarters pick the new rate up.
-* 0 error cells out of 4,732 recalculated cells in the empty template and 4,753 in the
+* 0 error cells out of 4,716 recalculated cells in the empty template and 4,737 in the
   example.
+* Validated with the Open XML SDK schema validator (`FileFormatVersions.Microsoft365`):
+  the only findings are 7 font child-order notices that openpyxl emits for every file it
+  writes — a trivial two-cell openpyxl workbook produces the same two notices, and Excel
+  accepts them (its repair log listed no style records).
 
 ## Worked example in the example file
 
